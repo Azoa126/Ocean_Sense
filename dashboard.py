@@ -1,169 +1,176 @@
 import asyncio
-import json
-import threading
-import time
-import streamlit as st
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, BackgroundTasks
+from pydantic import BaseModel
+import numpy as np
+import joblib
 import pandas as pd
-import plotly.express as px
-import plotly.graph_objects as go
-import websockets
+from typing import List
+import random
+import datetime
+import os
 
-# WebSocket URL of your backend
-WS_URL = "ws://127.0.0.1:8000/ws"
+# ==========================================================
+# 🌊 OCEANSENSE-FISH BACKEND
+# ==========================================================
+app = FastAPI(title="OceanSense-Fish Backend")
 
-st.set_page_config(page_title="🐟 OceanSense-Fish Dashboard", layout="wide")
+# ==========================================================
+# 🔹 LOAD LOCAL CSV DATA
+# ==========================================================
+csv_path = os.path.join(os.path.dirname(__file__), "OBIS_Fisheries_Merged.csv")
 
-st.title("🐟 OceanSense-Fish — Real-Time Fisheries Migration Dashboard")
-st.caption("Tracking simulated fish telemetry and productivity trends in real time.")
+if os.path.exists(csv_path):
+    fish_data = pd.read_csv(csv_path)
+    print(f"✅ Loaded CSV: {fish_data.shape[0]} rows × {fish_data.shape[1]} cols")
+else:
+    fish_data = pd.DataFrame()
+    print(f"⚠️ CSV not found at {csv_path}")
 
-# -----------------------------
-# Session state initialization
-# -----------------------------
-if "data" not in st.session_state:
-    st.session_state.data = pd.DataFrame(columns=["id", "lat", "lon", "speed", "heading", "timestamp"])
-if "connected" not in st.session_state:
-    st.session_state.connected = False
-if "last_update" not in st.session_state:
-    st.session_state.last_update = None
-if "history" not in st.session_state:
-    st.session_state.history = pd.DataFrame(columns=["id", "lat", "lon", "speed", "heading", "timestamp"])
-if "error" not in st.session_state:
-    st.session_state.error = None
-
-# -----------------------------
-# WebSocket listener
-# -----------------------------
-async def listen_for_data():
-    """Async WebSocket listener that updates session_state."""
+# ==========================================================
+# 🔹 LOAD RANDOM FOREST MODEL (Safe Load)
+# ==========================================================
+model_path = os.path.join(os.path.dirname(__file__), "rf_baseline_model.pkl")
+rf = None
+if os.path.exists(model_path):
     try:
-        async with websockets.connect(WS_URL) as websocket:
-            st.session_state.connected = True
-
-            while True:
-                try:
-                    msg = await asyncio.wait_for(websocket.recv(), timeout=5)
-                    message = json.loads(msg)
-
-                    if message["type"] == "snapshot" and message["positions"]:
-                        st.session_state.data = pd.DataFrame(
-                            [{"id": k, **v} for k, v in message["positions"].items()]
-                        )
-
-                    elif message["type"] == "telemetry_update":
-                        new_entry = pd.DataFrame([{
-                            "id": message["id"],
-                            "timestamp": message["timestamp"],
-                            "lat": message["lat"],
-                            "lon": message["lon"],
-                            "speed": message.get("speed"),
-                            "heading": message.get("heading")
-                        }])
-
-                        # Update latest positions
-                        df = pd.concat([st.session_state.data, new_entry]).drop_duplicates(subset="id", keep="last")
-                        st.session_state.data = df
-                        st.session_state.last_update = time.strftime("%H:%M:%S")
-
-                        # Append to full history
-                        st.session_state.history = pd.concat([st.session_state.history, new_entry])
-
-                except asyncio.TimeoutError:
-                    continue
-                except websockets.ConnectionClosed:
-                    st.session_state.connected = False
-                    break
-
+        rf = joblib.load(model_path)
+        print(f"✅ ML model loaded from {model_path}")
     except Exception as e:
-        st.session_state.connected = False
-        st.session_state.error = str(e)
+        print(f"⚠️ Error loading model: {e}")
+else:
+    print(f"⚠️ No model found at {model_path}. ML predictions disabled.")
 
-# -----------------------------
-# Start listener in background
-# -----------------------------
-def start_listener():
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    loop.run_until_complete(listen_for_data())
+# ==========================================================
+# 🔹 MACHINE LEARNING PREDICTION ENDPOINT
+# ==========================================================
+class PredictionInput(BaseModel):
+    sst: list
+    chl_anomaly: list
+    sss: list
 
-if "listener_started" not in st.session_state:
-    listener_thread = threading.Thread(target=start_listener, daemon=True)
-    listener_thread.start()
-    st.session_state.listener_started = True
+@app.post("/predict")
+def predict(input_data: PredictionInput):
+    if rf is None:
+        return {"error": "Model not loaded. Please ensure rf_baseline_model.pkl is available."}
 
-# -----------------------------
-# Dashboard layout
-# -----------------------------
-col1, col2 = st.columns([3, 1])
+    sst = np.array(input_data.sst)
+    chl = np.array(input_data.chl_anomaly)
+    sss = np.array(input_data.sss)
+    X_input = np.stack([sst.flatten(), chl.flatten(), sss.flatten()], axis=1)
+    y_pred = rf.predict(X_input)
+    grid_pred = y_pred.reshape(sst.shape)
+    return {"productivity_map": grid_pred.tolist()}
 
-# Left column: Map with trails
-with col1:
-    if not st.session_state.data.empty:
-        fig = go.Figure()
+# ==========================================================
+# 🔹 CSV DATA ENDPOINT (JSON-SAFE)
+# ==========================================================
+@app.get("/fish-data")
+def get_fish_data():
+    """Serve CSV data safely to dashboard (NaN -> None)."""
+    if fish_data.empty:
+        return {"message": "No CSV data available."}
 
-        # Add trails for each fish
-        for fish_id, fish_data in st.session_state.history.groupby("id"):
-            fig.add_trace(
-                go.Scattermapbox(
-                    lat=fish_data["lat"],
-                    lon=fish_data["lon"],
-                    mode="lines+markers",
-                    marker=dict(size=7),
-                    name=f"{fish_id} trail",
-                    hoverinfo="text",
-                    text=[
-                        f"ID: {row.id}<br>Speed: {row.speed}<br>Heading: {row.heading}<br>Time: {row.timestamp}"
-                        for row in fish_data.itertuples()
-                    ]
-                )
-            )
+    # Replace NaN and inf values with None for JSON
+    safe_df = fish_data.replace({np.nan: None, np.inf: None, -np.inf: None})
+    return safe_df.to_dict(orient="records")
 
-        # Map layout
-        fig.update_layout(
-            mapbox_style="carto-positron",
-            mapbox_zoom=4,
-            mapbox_center={"lat": 18.6, "lon": 73.9},
-            margin={"l":0,"r":0,"t":40,"b":0},
-            height=600,
-            title="Live Fish Telemetry Map with Trails"
-        )
-        st.plotly_chart(fig, use_container_width=True)
-    else:
-        st.info("Waiting for telemetry data...")
+# ==========================================================
+# 🔹 REAL-TIME TELEMETRY (WebSocket)
+# ==========================================================
+class ConnectionManager:
+    def __init__(self):
+        self.active_connections: List[WebSocket] = []
 
-# Right column: Info, table, charts
-with col2:
-    if st.session_state.connected:
-        st.success("✅ Connected to WebSocket")
-    else:
-        st.warning("⚠️ Connecting to backend...")
+    async def connect(self, websocket: WebSocket):
+        await websocket.accept()
+        self.active_connections.append(websocket)
 
-    if st.session_state.last_update:
-        st.caption(f"🕒 Last update: {st.session_state.last_update}")
+    def disconnect(self, websocket: WebSocket):
+        if websocket in self.active_connections:
+            self.active_connections.remove(websocket)
 
-    if st.session_state.error:
-        st.error(f"WebSocket error: {st.session_state.error}")
+    async def broadcast(self, message: dict):
+        living_connections = []
+        for connection in list(self.active_connections):
+            try:
+                await connection.send_json(message)
+                living_connections.append(connection)
+            except Exception:
+                pass
+        self.active_connections = living_connections
 
-    st.dataframe(st.session_state.data.sort_values("timestamp", ascending=False), height=200)
+manager = ConnectionManager()
+latest_positions = {}
 
-    # Real-time speed chart
-    if not st.session_state.history.empty:
-        speed_fig = px.line(
-            st.session_state.history,
-            x="timestamp",
-            y="speed",
-            color="id",
-            title="🐟 Fish Speed Over Time"
-        )
-        st.plotly_chart(speed_fig, use_container_width=True)
+class Telemetry(BaseModel):
+    id: str
+    timestamp: str
+    lat: float
+    lon: float
+    speed: float = None
+    heading: float = None
+    extra: dict = None
 
-    # Real-time heading chart
-    if not st.session_state.history.empty:
-        heading_fig = px.histogram(
-            st.session_state.history,
-            x="heading",
-            color="id",
-            nbins=36,
-            title="🧭 Fish Heading Distribution",
-            opacity=0.7
-        )
-        st.plotly_chart(heading_fig, use_container_width=True)
+@app.post("/ingest")
+async def ingest_telemetry(payload: Telemetry, background_tasks: BackgroundTasks):
+    """Receive telemetry data and broadcast to clients."""
+    latest_positions[payload.id] = {
+        "timestamp": payload.timestamp,
+        "lat": payload.lat,
+        "lon": payload.lon,
+        "speed": payload.speed,
+        "heading": payload.heading,
+        "extra": payload.extra,
+    }
+    message = {
+        "type": "telemetry_update",
+        "id": payload.id,
+        "timestamp": payload.timestamp,
+        "lat": payload.lat,
+        "lon": payload.lon,
+        "speed": payload.speed,
+        "heading": payload.heading,
+    }
+    background_tasks.add_task(manager.broadcast, message)
+    return {"status": "ok"}
+
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    """Handle WebSocket connections."""
+    await manager.connect(websocket)
+    try:
+        # Send snapshot of current positions
+        snapshot = {"type": "snapshot", "positions": latest_positions}
+        await websocket.send_json(snapshot)
+        while True:
+            data = await websocket.receive_text()
+            await websocket.send_text(f"Server received: {data}")
+    except WebSocketDisconnect:
+        manager.disconnect(websocket)
+
+# ==========================================================
+# 🔹 SIMULATED TELEMETRY
+# ==========================================================
+async def simulate_telemetry():
+    """Generate simulated fish movement data."""
+    fish_ids = ["fish1", "fish2", "fish3"]
+    while True:
+        for fish_id in fish_ids:
+            payload = {
+                "type": "telemetry_update",
+                "id": fish_id,
+                "timestamp": datetime.datetime.utcnow().isoformat(),
+                "lat": 18.5 + random.random(),
+                "lon": 73.8 + random.random(),
+                "speed": round(random.uniform(1, 5), 2),
+                "heading": random.randint(0, 360)
+            }
+            latest_positions[payload["id"]] = payload
+            await manager.broadcast(payload)
+        await asyncio.sleep(2)
+
+@app.on_event("startup")
+async def start_simulation():
+    """Run telemetry simulation at startup."""
+    asyncio.create_task(simulate_telemetry())
+
