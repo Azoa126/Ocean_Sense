@@ -1,47 +1,83 @@
+import asyncio
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, BackgroundTasks
 from pydantic import BaseModel
 import numpy as np
 import joblib
-import asyncio
+import pandas as pd
 from typing import List
 import random
 import datetime
+import os
 
-# Initialize FastAPI app
+# ==========================================================
+# 🌊 OCEANSENSE-FISH BACKEND
+# ==========================================================
 app = FastAPI(title="OceanSense-Fish Backend")
 
-# -----------------------------
-# 🔹 MACHINE LEARNING PREDICTION ENDPOINT
-# -----------------------------
+# ==========================================================
+# 🔹 LOAD LOCAL CSV DATA
+# ==========================================================
+csv_path = os.path.join(os.path.dirname(__file__), "OBIS_Fisheries_Merged.csv")
 
+if os.path.exists(csv_path):
+    fish_data = pd.read_csv(csv_path)
+    print(f"✅ Loaded CSV: {fish_data.shape[0]} rows × {fish_data.shape[1]} cols")
+else:
+    fish_data = pd.DataFrame()
+    print(f"⚠️ CSV not found at {csv_path}")
+
+# ==========================================================
+# 🔹 LOAD RANDOM FOREST MODEL (Safe Load)
+# ==========================================================
+model_path = os.path.join(os.path.dirname(__file__), "rf_baseline_model.pkl")
+rf = None
+if os.path.exists(model_path):
+    try:
+        rf = joblib.load(model_path)
+        print(f"✅ ML model loaded from {model_path}")
+    except Exception as e:
+        print(f"⚠️ Error loading model: {e}")
+else:
+    print(f"⚠️ No model found at {model_path}. ML predictions disabled.")
+
+# ==========================================================
+# 🔹 MACHINE LEARNING PREDICTION ENDPOINT
+# ==========================================================
 class PredictionInput(BaseModel):
     sst: list
     chl_anomaly: list
     sss: list
 
-# Load your trained Random Forest model
-rf = joblib.load("rf_baseline_model.pkl")
-
 @app.post("/predict")
 def predict(input_data: PredictionInput):
-    """Predict productivity map based on SST, CHL anomaly, and SSS"""
+    if rf is None:
+        return {"error": "Model not loaded. Please ensure rf_baseline_model.pkl is available."}
+
     sst = np.array(input_data.sst)
     chl = np.array(input_data.chl_anomaly)
     sss = np.array(input_data.sss)
-
     X_input = np.stack([sst.flatten(), chl.flatten(), sss.flatten()], axis=1)
     y_pred = rf.predict(X_input)
     grid_pred = y_pred.reshape(sst.shape)
-
     return {"productivity_map": grid_pred.tolist()}
 
+# ==========================================================
+# 🔹 CSV DATA ENDPOINT (JSON-SAFE)
+# ==========================================================
+@app.get("/fish-data")
+def get_fish_data():
+    """Serve CSV data safely to dashboard (NaN -> None)."""
+    if fish_data.empty:
+        return {"message": "No CSV data available."}
 
-# -----------------------------
-# 🔹 REAL-TIME TELEMETRY + WEBSOCKET SYSTEM
-# -----------------------------
+    # Replace NaN and inf values with None for JSON
+    safe_df = fish_data.replace({np.nan: None, np.inf: None, -np.inf: None})
+    return safe_df.to_dict(orient="records")
 
+# ==========================================================
+# 🔹 REAL-TIME TELEMETRY (WebSocket)
+# ==========================================================
 class ConnectionManager:
-    """Manage WebSocket connections"""
     def __init__(self):
         self.active_connections: List[WebSocket] = []
 
@@ -54,22 +90,18 @@ class ConnectionManager:
             self.active_connections.remove(websocket)
 
     async def broadcast(self, message: dict):
-        """Send a message to all active WebSocket clients"""
         living_connections = []
         for connection in list(self.active_connections):
             try:
                 await connection.send_json(message)
                 living_connections.append(connection)
             except Exception:
-                # Ignore dead connections
                 pass
         self.active_connections = living_connections
 
-
-# Instantiate connection manager
 manager = ConnectionManager()
+latest_positions = {}
 
-# Model for incoming telemetry data
 class Telemetry(BaseModel):
     id: str
     timestamp: str
@@ -79,14 +111,9 @@ class Telemetry(BaseModel):
     heading: float = None
     extra: dict = None
 
-
-# In-memory store for latest positions (replace with DB for production)
-latest_positions = {}
-
-
 @app.post("/ingest")
 async def ingest_telemetry(payload: Telemetry, background_tasks: BackgroundTasks):
-    """Receive telemetry and broadcast to connected WebSocket clients"""
+    """Receive telemetry data and broadcast to clients."""
     latest_positions[payload.id] = {
         "timestamp": payload.timestamp,
         "lat": payload.lat,
@@ -95,7 +122,6 @@ async def ingest_telemetry(payload: Telemetry, background_tasks: BackgroundTasks
         "heading": payload.heading,
         "extra": payload.extra,
     }
-
     message = {
         "type": "telemetry_update",
         "id": payload.id,
@@ -105,36 +131,28 @@ async def ingest_telemetry(payload: Telemetry, background_tasks: BackgroundTasks
         "speed": payload.speed,
         "heading": payload.heading,
     }
-
-    # Broadcast asynchronously
     background_tasks.add_task(manager.broadcast, message)
     return {"status": "ok"}
 
-
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
-    """Handle WebSocket connections for live telemetry updates"""
+    """Handle WebSocket connections."""
     await manager.connect(websocket)
     try:
-        # Send initial snapshot of current positions
+        # Send snapshot of current positions
         snapshot = {"type": "snapshot", "positions": latest_positions}
         await websocket.send_json(snapshot)
-
-        # Listen for messages from client (optional)
         while True:
             data = await websocket.receive_text()
             await websocket.send_text(f"Server received: {data}")
-
     except WebSocketDisconnect:
         manager.disconnect(websocket)
 
-
-# -----------------------------
-# 🔹 SIMULATED TELEMETRY FOR DEMO
-# -----------------------------
-
+# ==========================================================
+# 🔹 SIMULATED TELEMETRY
+# ==========================================================
 async def simulate_telemetry():
-    """Simulate live telemetry for demo purposes"""
+    """Generate simulated fish movement data."""
     fish_ids = ["fish1", "fish2", "fish3"]
     while True:
         for fish_id in fish_ids:
@@ -147,20 +165,11 @@ async def simulate_telemetry():
                 "speed": round(random.uniform(1, 5), 2),
                 "heading": random.randint(0, 360)
             }
-            # Update in-memory positions
-            latest_positions[payload["id"]] = {
-                "timestamp": payload["timestamp"],
-                "lat": payload["lat"],
-                "lon": payload["lon"],
-                "speed": payload["speed"],
-                "heading": payload["heading"]
-            }
-            # Broadcast to connected WebSocket clients
+            latest_positions[payload["id"]] = payload
             await manager.broadcast(payload)
         await asyncio.sleep(2)
 
-
 @app.on_event("startup")
 async def start_simulation():
-    """Start telemetry simulation on app startup"""
+    """Run telemetry simulation at startup."""
     asyncio.create_task(simulate_telemetry())
